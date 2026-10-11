@@ -1,4 +1,5 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/fused_moe.py
+# Modified from SGLang v0.4.10 (https://github.com/sgl-project/sglang) for Libra (ICLR 2026).
 
 """Fused MoE kernel."""
 
@@ -1009,6 +1010,7 @@ def inplace_fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     routed_scaling_factor: Optional[float] = None,
+    local_dp_rank: int = 0,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -1033,6 +1035,7 @@ def inplace_fused_experts(
         block_shape,
         False,
         routed_scaling_factor,
+        local_dp_rank,
     )
 
 
@@ -1174,6 +1177,7 @@ def fused_experts(
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
+    local_dp_rank: int = 0,
 ):
     topk_weights, topk_ids, _ = topk_output
     if inplace:
@@ -1199,6 +1203,7 @@ def fused_experts(
             a2_scale,
             block_shape,
             routed_scaling_factor,
+            local_dp_rank,
         )
         return hidden_states
     else:
@@ -1342,6 +1347,7 @@ def fused_experts_impl(
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
+    local_dp_rank: int = 0,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:

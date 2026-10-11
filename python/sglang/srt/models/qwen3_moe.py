@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# Modified from SGLang v0.4.10 (https://github.com/sgl-project/sglang) for Libra (ICLR 2026).
 
 
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
@@ -41,6 +42,8 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     get_local_attention_dp_size,
+    get_local_attention_dp_rank,
+    get_dp_local_info
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -73,6 +76,24 @@ from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
 from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_non_idle_and_non_empty
+
+
+from torch.cuda import nvtx
+from sglang.srt.utils import (
+    find_rows_with_large_diff, 
+    EXPERT_DUP_FACTOR_N,
+    EXPERT_DUP_FACTOR_L,
+    EXPERT_DUP_MAX,
+    MIN_TOKEN_LIMIT,
+    broadcast_topk,
+    broadcast_topk_with_next,
+    compute_cum_recv_map_len,
+    P2PPlan,
+    get_libra_scheme,
+)
+from sglang.load_balance import prefetch, rebalance
+from sglang.srt.layers.moe.ep_moe.kernels import fused_add_without_zero_init_v2
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 Qwen3MoeConfig = None
 
@@ -143,13 +164,32 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 config.num_experts + global_server_args_dict["ep_num_redundant_experts"]
             )
             self.top_k = config.num_experts_per_tok
+        
+        
+        self.local_dp_rank = get_local_attention_dp_rank()
 
     def forward(
-        self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
+        self, 
+        hidden_states: torch.Tensor, 
+        forward_batch: Optional[ForwardBatch] = None, 
+        is_ours: bool = False, 
+        topk_ids_mask: torch.Tensor = None,
+        w1_buf: torch.Tensor = None,
+        w2_buf: torch.Tensor = None,
+        topk_output: StandardTopKOutput = None,
     ) -> torch.Tensor:
 
         if not global_server_args_dict["enable_deepep_moe"]:
-            return self.forward_normal(hidden_states)
+            if is_ours:
+                return self.forward_normal_ours(
+                    hidden_states, 
+                    topk_ids_mask=topk_ids_mask,
+                    w1_buf=w1_buf,
+                    w2_buf=w2_buf,
+                    topk_output=topk_output,
+                )
+            else:
+                return self.forward_normal_ori(hidden_states)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
 
@@ -160,16 +200,72 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             if name not in ["correction_bias"]
         ]
 
-    def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_normal_ori(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
+        ###############################################################
+        # NOTE: Gate/Top-k
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        expert_location_dispatch_info = ExpertLocationDispatchInfo.init_new(
+                layer_id=self.layer_id,
+            )
+        topk_output = self.topk(
+            hidden_states, 
+            router_logits,
+            expert_location_dispatch_info=expert_location_dispatch_info
+        )
+        ###############################################################
+
+        ###############################################################
+        # NOTE: MoE Computation
         final_hidden_states = self.experts(hidden_states, topk_output)
+        ###############################################################
+
+        ###############################################################
+        # NOTE: Combine
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        ###############################################################
+
+        return final_hidden_states.view(num_tokens, hidden_dim)
+    
+    def forward_normal_ours(
+            self, 
+            hidden_states: torch.Tensor, 
+            topk_ids_mask: torch.Tensor = None,
+            w1_buf: torch.Tensor = None,
+            w2_buf: torch.Tensor = None,
+            topk_output: StandardTopKOutput = None,
+        ) -> torch.Tensor:
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        ###############################################################
+        # NOTE: Gate/Top-k
+        if topk_output is None:
+            # router_logits: (num_tokens, n_experts)
+            router_logits, _ = self.gate(hidden_states)
+            expert_location_dispatch_info = ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                )
+            topk_output = self.topk(
+                hidden_states, 
+                router_logits,
+                expert_location_dispatch_info=expert_location_dispatch_info
+            )
+        ###############################################################
+
+        ###############################################################
+        # NOTE: MoE Computation
+        final_hidden_states = self.experts(
+            hidden_states, 
+            topk_output, 
+            topk_ids_mask=topk_ids_mask,
+            w1_buf=w1_buf,
+            w2_buf=w2_buf,
+        )
+        ###############################################################
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -407,9 +503,13 @@ class Qwen3MoeAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        event: Optional[torch.cuda.Event] = None,
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
+        
+        if event is not None:
+            event.record()
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
@@ -425,16 +525,19 @@ class Qwen3MoeAttention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        event: Optional[torch.cuda.Event] = None,
     ) -> torch.Tensor:
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            event=event,
         )
         return self.forward_core(s)
 
@@ -479,7 +582,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
+        
+        self.is_correctness = False
+        self.is_ori = get_libra_scheme() in ("sglang", "eplb")
+        self.imbalance_ratio = False
         self.local_dp_size = get_local_attention_dp_size()
+        self.local_dp_rank = get_local_attention_dp_rank()
 
         # Qwen3MoE all layers are sparse and have no nextn now
         self.is_layer_sparse = True
@@ -518,36 +626,1039 @@ class Qwen3MoeDecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
         )
 
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        # CUDA Stream
+        rebalance_stream: torch.Stream, 
+        prefetch_original_stream: torch.Stream, 
+        prefetch_build_stream: torch.Stream, 
+        prefetch_exec_w1_stream: torch.Stream, 
+        prefetch_exec_w2_stream: torch.Stream, 
+        dispatch_stream: torch.Stream, 
+        output_stream: torch.Stream, 
+        # Prefetcher
+        next_gate: Optional[torch.nn.Module],
+        next_w13_weight: Optional[torch.Tensor], 
+        next_w2_weight: Optional[torch.Tensor], 
+        # MoE computation buffers
+        w13_weight_buf_odd: Optional[torch.Tensor], 
+        w2_weight_buf_odd: Optional[torch.Tensor], 
+        w13_weight_buf_even: Optional[torch.Tensor], 
+        w2_weight_buf_even: Optional[torch.Tensor],
+        # MoE computation handlers
+        w13_weight_hdl_odd: Any, 
+        w2_weight_hdl_odd: Any, 
+        w13_weight_hdl_even: Any, 
+        w2_weight_hdl_even: Any,
+        next_topk_ids_cpu: Optional[torch.Tensor],
+        topk_ids_cpu: Optional[torch.Tensor],
+        topk_ids_mask: Optional[torch.Tensor],
+        topk_ids_mask_cpu: Optional[torch.Tensor],
+        send_map_local: Optional[torch.Tensor],
+        send_map_local_gpu: Optional[torch.Tensor],
+        send_map_local_len: Optional[torch.Tensor],
+        recv_map_local_len: Optional[torch.Tensor],
+        recv_experts_cur_rank_tensor: Optional[torch.Tensor],
+        recv_experts_cur_rank_tensor_cpu: Optional[torch.Tensor],
+        recv_num_experts: Optional[torch.Tensor],
+        expert_gpu_mapping: Optional[torch.Tensor],
+        remote_gpu_expert_load: Optional[torch.Tensor],
+        topk_ids_buf: torch.Tensor,
+        topk_weights_buf: torch.Tensor,
+        next_topk_ids_buf: torch.Tensor,
+        topk_ids_hdl: Any,
+        topk_weights_hdl: Any,
+        next_topk_ids_hdl: Any,
+        hidden_states_for_prefetch_rebalance: Optional[torch.Tensor],
+        q_len: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.is_ori:
+            # NOTE: Original forward (SGLang / EPLB baselines)
+            hidden_states, residual, _ = self.forward_ori(
+                positions=positions, 
+                hidden_states=hidden_states, 
+                forward_batch=forward_batch, 
+                residual=residual
+            )
+            return (
+                hidden_states,
+                residual,
+                None,
+                None,
+                None,
+                None,
+                None
+            )
+        if not self.is_correctness:
+            # NOTE: Libra forward
+            if self.layer_id < q_len:
+                (
+                    hidden_states, 
+                    residual, 
+                    recv_experts_next_cur_rank_tensor, 
+                    recv_experts_next_cur_rank_tensor_cpu, 
+                    recv_num_experts_next,
+                    next_expert_gpu_mapping,
+                    next_remote_gpu_expert_load,
+                ) = self.forward_mid_first(
+                    positions=positions, 
+                    hidden_states=hidden_states, 
+                    forward_batch=forward_batch, 
+                    residual=residual,
+                    hidden_states_ori_all=None,
+                    rebalance_stream=rebalance_stream,
+                    prefetch_original_stream=prefetch_original_stream,
+                    prefetch_build_stream=prefetch_build_stream,
+                    prefetch_exec_w1_stream=prefetch_exec_w1_stream,
+                    prefetch_exec_w2_stream=prefetch_exec_w2_stream,
+                    dispatch_stream=dispatch_stream,
+                    output_stream=output_stream,
+                    next_gate=next_gate,
+                    next_w13_weight=next_w13_weight,
+                    next_w2_weight=next_w2_weight,
+                    w13_weight_buf_odd=w13_weight_buf_odd,
+                    w2_weight_buf_odd=w2_weight_buf_odd,
+                    w13_weight_buf_even=w13_weight_buf_even,
+                    w2_weight_buf_even=w2_weight_buf_even,
+                    w13_weight_hdl_odd=w13_weight_hdl_odd,
+                    w2_weight_hdl_odd=w2_weight_hdl_odd,
+                    w13_weight_hdl_even=w13_weight_hdl_even,
+                    w2_weight_hdl_even=w2_weight_hdl_even,
+                    next_topk_ids_cpu=next_topk_ids_cpu,
+                    topk_ids_cpu=topk_ids_cpu,
+                    topk_ids_mask=topk_ids_mask,
+                    topk_ids_mask_cpu=topk_ids_mask_cpu,
+                    send_map_local=send_map_local,
+                    send_map_local_gpu=send_map_local_gpu,
+                    send_map_local_len=send_map_local_len,
+                    recv_map_local_len=recv_map_local_len,
+                    recv_experts_cur_rank_tensor=recv_experts_cur_rank_tensor,
+                    recv_experts_cur_rank_tensor_cpu=recv_experts_cur_rank_tensor_cpu,
+                    recv_num_experts=recv_num_experts,
+                    expert_gpu_mapping=expert_gpu_mapping,
+                    remote_gpu_expert_load=remote_gpu_expert_load,
+                    hidden_states_for_prefetch_rebalance=hidden_states_for_prefetch_rebalance,
+                )
+            else:
+                (
+                    hidden_states, 
+                    residual, 
+                    recv_experts_next_cur_rank_tensor, 
+                    recv_experts_next_cur_rank_tensor_cpu, 
+                    recv_num_experts_next,
+                    next_expert_gpu_mapping,
+                    next_remote_gpu_expert_load,
+                ) = self.forward_mid(
+                    positions=positions, 
+                    hidden_states=hidden_states, 
+                    forward_batch=forward_batch, 
+                    residual=residual,
+                    hidden_states_ori_all=None,
+                    rebalance_stream=rebalance_stream,
+                    prefetch_original_stream=prefetch_original_stream,
+                    prefetch_build_stream=prefetch_build_stream,
+                    prefetch_exec_w1_stream=prefetch_exec_w1_stream,
+                    prefetch_exec_w2_stream=prefetch_exec_w2_stream,
+                    dispatch_stream=dispatch_stream,
+                    output_stream=output_stream,
+                    next_gate=next_gate,
+                    next_w13_weight=next_w13_weight,
+                    next_w2_weight=next_w2_weight,
+                    w13_weight_buf_odd=w13_weight_buf_odd,
+                    w2_weight_buf_odd=w2_weight_buf_odd,
+                    w13_weight_buf_even=w13_weight_buf_even,
+                    w2_weight_buf_even=w2_weight_buf_even,
+                    w13_weight_hdl_odd=w13_weight_hdl_odd,
+                    w2_weight_hdl_odd=w2_weight_hdl_odd,
+                    w13_weight_hdl_even=w13_weight_hdl_even,
+                    w2_weight_hdl_even=w2_weight_hdl_even,
+                    next_topk_ids_cpu=next_topk_ids_cpu,
+                    topk_ids_cpu=topk_ids_cpu,
+                    topk_ids_mask=topk_ids_mask,
+                    topk_ids_mask_cpu=topk_ids_mask_cpu,
+                    send_map_local=send_map_local,
+                    send_map_local_gpu=send_map_local_gpu,
+                    send_map_local_len=send_map_local_len,
+                    recv_map_local_len=recv_map_local_len,
+                    recv_experts_cur_rank_tensor=recv_experts_cur_rank_tensor,
+                    recv_experts_cur_rank_tensor_cpu=recv_experts_cur_rank_tensor_cpu,
+                    recv_num_experts=recv_num_experts,
+                    expert_gpu_mapping=expert_gpu_mapping,
+                    remote_gpu_expert_load=remote_gpu_expert_load,
+                    topk_ids_buf=topk_ids_buf,
+                    topk_weights_buf=topk_weights_buf,
+                    next_topk_ids_buf=next_topk_ids_buf,
+                    topk_ids_hdl=topk_ids_hdl,
+                    topk_weights_hdl=topk_weights_hdl,
+                    next_topk_ids_hdl=next_topk_ids_hdl,
+                    hidden_states_for_prefetch_rebalance=hidden_states_for_prefetch_rebalance,
+                )
 
+            return (
+                hidden_states, 
+                residual, 
+                recv_experts_next_cur_rank_tensor, 
+                recv_experts_next_cur_rank_tensor_cpu, 
+                recv_num_experts_next,
+                next_expert_gpu_mapping,
+                next_remote_gpu_expert_load,
+            )
+        else:
+            # NOTE: Correctness test: run the original and the Libra path and compare them
+            hidden_states_ori = hidden_states.detach().clone().contiguous()
+            hidden_states_mid = hidden_states.detach().clone().contiguous()
+            residual_ori, residual_mid = None, None
+            if residual is not None:
+                residual_ori = residual.detach().clone()
+                residual_mid = residual.detach().clone()
+            hidden_states_ori, residual_ori, hidden_states_ori_all = self.forward_ori(
+                positions=positions, 
+                hidden_states=hidden_states_ori, 
+                forward_batch=forward_batch, 
+                residual=residual_ori
+            )
+            hidden_states_ori_result = hidden_states_ori.detach().clone().contiguous()
+            residual_ori_result = residual_ori.detach().clone().contiguous()
+            if self.layer_id < q_len:
+                (
+                    hidden_states_mid, 
+                    residual_mid, 
+                    recv_experts_next_cur_rank_tensor, 
+                    recv_experts_next_cur_rank_tensor_cpu, 
+                    recv_num_experts_next,
+                    next_expert_gpu_mapping,
+                    next_remote_gpu_expert_load,
+                ) = self.forward_mid_first(
+                    positions=positions, 
+                    hidden_states=hidden_states_mid, 
+                    forward_batch=forward_batch, 
+                    residual=residual_mid,
+                    hidden_states_ori_all=hidden_states_ori_all,
+                    rebalance_stream=rebalance_stream,
+                    prefetch_original_stream=prefetch_original_stream,
+                    prefetch_build_stream=prefetch_build_stream,
+                    prefetch_exec_w1_stream=prefetch_exec_w1_stream,
+                    prefetch_exec_w2_stream=prefetch_exec_w2_stream,
+                    dispatch_stream=dispatch_stream,
+                    output_stream=output_stream,
+                    next_gate=next_gate,
+                    next_w13_weight=next_w13_weight,
+                    next_w2_weight=next_w2_weight,
+                    w13_weight_buf_odd=w13_weight_buf_odd,
+                    w2_weight_buf_odd=w2_weight_buf_odd,
+                    w13_weight_buf_even=w13_weight_buf_even,
+                    w2_weight_buf_even=w2_weight_buf_even,
+                    w13_weight_hdl_odd=w13_weight_hdl_odd,
+                    w2_weight_hdl_odd=w2_weight_hdl_odd,
+                    w13_weight_hdl_even=w13_weight_hdl_even,
+                    w2_weight_hdl_even=w2_weight_hdl_even,
+                    next_topk_ids_cpu=next_topk_ids_cpu,
+                    topk_ids_cpu=topk_ids_cpu,
+                    topk_ids_mask=topk_ids_mask,
+                    topk_ids_mask_cpu=topk_ids_mask_cpu,
+                    send_map_local=send_map_local,
+                    send_map_local_gpu=send_map_local_gpu,
+                    send_map_local_len=send_map_local_len,
+                    recv_map_local_len=recv_map_local_len,
+                    recv_experts_cur_rank_tensor=recv_experts_cur_rank_tensor,
+                    recv_experts_cur_rank_tensor_cpu=recv_experts_cur_rank_tensor_cpu,
+                    recv_num_experts=recv_num_experts,
+                    expert_gpu_mapping=expert_gpu_mapping,
+                    remote_gpu_expert_load=remote_gpu_expert_load,
+                    hidden_states_for_prefetch_rebalance=hidden_states_for_prefetch_rebalance,
+                )
+            else:
+                (
+                    hidden_states_mid, 
+                    residual_mid, 
+                    recv_experts_next_cur_rank_tensor, 
+                    recv_experts_next_cur_rank_tensor_cpu, 
+                    recv_num_experts_next,
+                    next_expert_gpu_mapping,
+                    next_remote_gpu_expert_load,
+                ) = self.forward_mid(
+                    positions=positions, 
+                    hidden_states=hidden_states_mid, 
+                    forward_batch=forward_batch, 
+                    residual=residual_mid,
+                    hidden_states_ori_all=hidden_states_ori_all,
+                    rebalance_stream=rebalance_stream,
+                    prefetch_original_stream=prefetch_original_stream,
+                    prefetch_build_stream=prefetch_build_stream,
+                    prefetch_exec_w1_stream=prefetch_exec_w1_stream,
+                    prefetch_exec_w2_stream=prefetch_exec_w2_stream,
+                    dispatch_stream=dispatch_stream,
+                    output_stream=output_stream,
+                    next_gate=next_gate,
+                    next_w13_weight=next_w13_weight,
+                    next_w2_weight=next_w2_weight,
+                    w13_weight_buf_odd=w13_weight_buf_odd,
+                    w2_weight_buf_odd=w2_weight_buf_odd,
+                    w13_weight_buf_even=w13_weight_buf_even,
+                    w2_weight_buf_even=w2_weight_buf_even,
+                    w13_weight_hdl_odd=w13_weight_hdl_odd,
+                    w2_weight_hdl_odd=w2_weight_hdl_odd,
+                    w13_weight_hdl_even=w13_weight_hdl_even,
+                    w2_weight_hdl_even=w2_weight_hdl_even,
+                    next_topk_ids_cpu=next_topk_ids_cpu,
+                    topk_ids_cpu=topk_ids_cpu,
+                    topk_ids_mask=topk_ids_mask,
+                    topk_ids_mask_cpu=topk_ids_mask_cpu,
+                    send_map_local=send_map_local,
+                    send_map_local_gpu=send_map_local_gpu,
+                    send_map_local_len=send_map_local_len,
+                    recv_map_local_len=recv_map_local_len,
+                    recv_experts_cur_rank_tensor=recv_experts_cur_rank_tensor,
+                    recv_experts_cur_rank_tensor_cpu=recv_experts_cur_rank_tensor_cpu,
+                    recv_num_experts=recv_num_experts,
+                    expert_gpu_mapping=expert_gpu_mapping,
+                    remote_gpu_expert_load=remote_gpu_expert_load,
+                    topk_ids_buf=topk_ids_buf,
+                    topk_weights_buf=topk_weights_buf,
+                    next_topk_ids_buf=next_topk_ids_buf,
+                    topk_ids_hdl=topk_ids_hdl,
+                    topk_weights_hdl=topk_weights_hdl,
+                    next_topk_ids_hdl=next_topk_ids_hdl,
+                    hidden_states_for_prefetch_rebalance=hidden_states_for_prefetch_rebalance,
+                )
+            hidden_states_ori.copy_(hidden_states_ori_result)
+            residual_ori.copy_(residual_ori_result)
+            return (
+                hidden_states_ori, 
+                residual_ori, 
+                recv_experts_next_cur_rank_tensor, 
+                recv_experts_next_cur_rank_tensor_cpu, 
+                recv_num_experts_next,
+                next_expert_gpu_mapping,
+                next_remote_gpu_expert_load,
+            )
+    
+    def forward_ori(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        nvtx.range_push("forward_ori")
+        nvtx.range_push("RMSNorm")
+        ########################################################################
+        # NOTE: Update the expert_map_gpu
+        self.mlp.experts.expert_map_gpu_extended.copy_(self.mlp.experts.expert_map_gpu)
+        ########################################################################
+
+        ########################################################################
+        # NOTE: RMSNorm
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
-
+        ########################################################################
+        nvtx.range_pop()
+        nvtx.range_push("Attention")
+        ########################################################################
+        # NOTE: Attention
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+        nvtx.range_pop()
+        ########################################################################
 
+        ########################################################################
+        # NOTE: Dispatch
+        # Residual connection
+        nvtx.range_push("Dispatch")
+        hidden_states += residual
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        ########################################################################
+        nvtx.range_pop()
+        nvtx.range_push("MoE")
+        ########################################################################
+        # NOTE: MoE
+        hidden_states = self.mlp(hidden_states, forward_batch, is_ours=True)
+        ########################################################################
+        nvtx.range_pop()
+        nvtx.range_push("Combine")
+        ########################################################################
+        # NOTE: Combine
+        if self.local_dp_size > 1:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        ########################################################################
+        hidden_states_ori_all = hidden_states.detach().clone()
+        nvtx.range_pop()
 
-        hidden_states = self.mlp(hidden_states, forward_batch)
-
+        nvtx.range_push("Postprocess")
+        ########################################################################
+        # NOTE: Post-processing => Reduce the first dimension
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
+        ########################################################################
+        nvtx.range_pop()
 
-        return hidden_states, residual
+        nvtx.range_pop()
+        return hidden_states, residual, hidden_states_ori_all
+
+
+    def forward_mid_first(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        hidden_states_ori_all: Optional[torch.Tensor],
+        # CUDA Stream
+        rebalance_stream: torch.Stream, 
+        prefetch_original_stream: torch.Stream, 
+        prefetch_build_stream: torch.Stream, 
+        prefetch_exec_w1_stream: torch.Stream, 
+        prefetch_exec_w2_stream: torch.Stream, 
+        dispatch_stream: torch.Stream, 
+        output_stream: torch.Stream, 
+        next_gate: Optional[torch.nn.Module],
+        next_w13_weight: Optional[torch.Tensor], 
+        next_w2_weight: Optional[torch.Tensor], 
+        w13_weight_buf_odd: Optional[torch.Tensor], 
+        w2_weight_buf_odd: Optional[torch.Tensor], 
+        w13_weight_buf_even: Optional[torch.Tensor], 
+        w2_weight_buf_even: Optional[torch.Tensor], 
+        w13_weight_hdl_odd: Any, 
+        w2_weight_hdl_odd: Any, 
+        w13_weight_hdl_even: Any, 
+        w2_weight_hdl_even: Any, 
+        next_topk_ids_cpu: Optional[torch.Tensor],
+        topk_ids_cpu: Optional[torch.Tensor],
+        topk_ids_mask: Optional[torch.Tensor],
+        topk_ids_mask_cpu: Optional[torch.Tensor],
+        send_map_local: Optional[torch.Tensor],
+        send_map_local_gpu: Optional[torch.Tensor],
+        send_map_local_len: Optional[torch.Tensor],
+        recv_map_local_len: Optional[torch.Tensor],
+        # Prefetch info
+        recv_experts_cur_rank_tensor: Optional[torch.Tensor],
+        recv_experts_cur_rank_tensor_cpu: Optional[torch.Tensor],
+        recv_num_experts: int,
+        expert_gpu_mapping: Optional[torch.Tensor],
+        remote_gpu_expert_load: Optional[torch.Tensor],
+        hidden_states_for_prefetch_rebalance: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        nvtx.range_push("forward_mid_first")
+        ########################################################################
+        
+        # CUDA Events
+        attn_done_event = torch.cuda.Event()
+        moe_local_done_event = torch.cuda.Event()
+        moe_remote_done_event = torch.cuda.Event()
+        prefetch_start_event = torch.cuda.Event()
+        prefetch_done_event = torch.cuda.Event()
+        dispatch_start_event = torch.cuda.Event()
+        dispatch_done_event = torch.cuda.Event()
+        output_done_event = torch.cuda.Event()
+        ########################################################################
+        nvtx.range_push("RMSNorm_first")
+        ########################################################################
+        # NOTE: RMSNorm & Attention
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
+        nvtx.range_pop()
+        nvtx.range_push("Attention_first")
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        ########################################################################
+        nvtx.range_pop()
+        nvtx.range_push("Dispatch_first")
+        ########################################################################
+        # NOTE: Dispatch
+        # Residual connection
+        hidden_states += residual
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+        hidden_states_for_prefetch_rebalance.copy_(hidden_states)
+        dispatch_done_event.record()
+        ########################################################################
+        nvtx.range_pop()
+        nvtx.range_push("MoE_first")
+        ########################################################################
+        # NOTE: MoE
+        hidden_states = self.mlp(hidden_states, forward_batch, is_ours=True)
+        moe_remote_done_event.record()
+        ########################################################################
+        nvtx.range_pop()
+        ########################################################################
+        # NOTE: Prefetch => Build and Execute Plans
+        with torch.cuda.stream(prefetch_build_stream):
+            prefetch_build_stream.wait_event(dispatch_done_event)
+            nvtx.range_push("Prefetch_first")
+            recv_experts_next_cur_rank_tensor = None
+            recv_experts_next_cur_rank_tensor_cpu = None
+            recv_num_experts_next = None
+            next_expert_gpu_mapping = None
+            next_remote_gpu_expert_load = None
+            if next_gate is not None:
+                next_router_logits, _ = next_gate(hidden_states_for_prefetch_rebalance)
+                next_topk_output = self.mlp.topk(hidden_states_for_prefetch_rebalance, next_router_logits)
+                # WARNING: D2H with Sync
+                next_topk_ids_cpu.copy_(next_topk_output.topk_ids, non_blocking=False)
+
+                next_expert_gpu_mapping, next_remote_gpu_expert_load, recv_experts_next_cur_rank_tensor_cpu = prefetch(
+                    next_topk_ids=next_topk_ids_cpu,
+                    num_experts=self.mlp.experts.num_experts,
+                    seq_len=hidden_states_for_prefetch_rebalance.shape[0] // self.local_dp_size,
+                    num_gpus=self.local_dp_size,
+                    cur_rank=self.local_dp_rank,
+                    send_map_local_out=send_map_local,
+                    send_map_local_len_out=send_map_local_len,
+                    recv_map_local_len_out=recv_map_local_len,
+                    max_dup_per_gpu=EXPERT_DUP_FACTOR_N,
+                    n_local_dup_per_gpu=EXPERT_DUP_FACTOR_L,
+                    max_send_len=EXPERT_DUP_MAX,
+                    force_max_dup=False
+                )
+
+                recv_num_experts_next = recv_experts_next_cur_rank_tensor_cpu.numel()
+                # WARNING: H2D Sync
+                recv_experts_next_cur_rank_tensor = recv_experts_next_cur_rank_tensor_cpu.to(hidden_states_for_prefetch_rebalance.device)
+
+                # Build P2P plans for w13 and w2
+                cum = compute_cum_recv_map_len(recv_map_local_len)
+                prefetch_plan = P2PPlan(
+                    w13_weight=next_w13_weight,
+                    w2_weight=next_w2_weight,
+                    w13_weight_hdl=w13_weight_hdl_odd if self.layer_id % 2 == 0 else w13_weight_hdl_even,
+                    w2_weight_hdl=w2_weight_hdl_odd if self.layer_id % 2 == 0 else w2_weight_hdl_even,
+                    send_map=send_map_local.clone(),
+                    send_map_len=send_map_local_len.clone(),
+                    recv_map_len=recv_map_local_len.clone(),
+                    cum_recv_map_len=cum,
+                    dp_size=self.local_dp_size,
+                    dp_rank=self.local_dp_rank,
+                    w13_weight_buf_shape=w13_weight_buf_even.shape,
+                    w2_weight_buf_shape=w2_weight_buf_even.shape
+                )
+                num_ori_experts = self.mlp.experts.num_local_experts
+                for i in range(prefetch_plan.dp_size):
+                    rows = int(prefetch_plan.send_map_len[self.local_dp_rank, i].item())
+                    if rows == 0 or i == self.local_dp_rank:
+                        continue
+                    dst_off = int(prefetch_plan.cum_recv_map_len[i, self.local_dp_rank].item())
+                    for k in range(rows):
+                        expert_id = int(prefetch_plan.send_map[self.local_dp_rank, i, k].item())
+                        # 1-row view [1, D]
+                        src_w13_row = prefetch_plan.w13_weight.narrow(0, expert_id, 1)
+                        src_w2_row = prefetch_plan.w2_weight.narrow(0, expert_id, 1)
+                        peer_w13_buf = prefetch_plan.w13_weight_hdl.get_buffer(
+                            i, 
+                            prefetch_plan.w13_weight_buf_shape, 
+                            dtype=prefetch_plan.w13_weight.dtype
+                        )
+                        peer_w2_buf = prefetch_plan.w2_weight_hdl.get_buffer(
+                            i, 
+                            prefetch_plan.w2_weight_buf_shape, 
+                            dtype=prefetch_plan.w2_weight.dtype
+                        )
+                        peer_w13_buf.narrow(0, num_ori_experts + dst_off + k, 1).copy_(src_w13_row)
+                        peer_w2_buf.narrow(0, num_ori_experts + dst_off + k, 1).copy_(src_w2_row)
+        ########################################################################
+        nvtx.range_pop()
+        nvtx.range_push("Combine_first")
+        ########################################################################
+        # NOTE: Combine
+        if self.local_dp_size > 1:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        ########################################################################
+        nvtx.range_pop()
+        ########################################################################
+        # NOTE: Copy the original weights to large buffers
+        with torch.cuda.stream(prefetch_original_stream):
+            assert w13_weight_buf_odd.is_contiguous(), "w13_weight_buf_odd is not contiguous"
+            assert w2_weight_buf_odd.is_contiguous(), "w2_weight_buf_odd is not contiguous"
+            assert w13_weight_buf_even.is_contiguous(), "w13_weight_buf_even is not contiguous"
+            assert w2_weight_buf_even.is_contiguous(), "w2_weight_buf_even is not contiguous"
+            # Stage the next layer's resident experts in rows [0:num_rows) of the other-parity buffer (row 0 first, then the rest).
+            num_rows = next_w13_weight.shape[0]
+            prefetch_original_stream.wait_event(output_done_event)
+            nvtx.range_push("Copy Buffer_first")
+            step = 1
+            if self.layer_id % 2 == 0:
+                w13_weight_buf_odd[:step].copy_(next_w13_weight[:step])
+                w13_weight_buf_odd[step:num_rows].copy_(next_w13_weight[step:num_rows])
+                w2_weight_buf_odd[:step].copy_(next_w2_weight[:step])
+                w2_weight_buf_odd[step:num_rows].copy_(next_w2_weight[step:num_rows])
+            else:
+                w13_weight_buf_even[:step].copy_(next_w13_weight[:step])
+                w13_weight_buf_even[step:num_rows].copy_(next_w13_weight[step:num_rows])
+                w2_weight_buf_even[:step].copy_(next_w2_weight[:step])
+                w2_weight_buf_even[step:num_rows].copy_(next_w2_weight[step:num_rows])
+        ########################################################################
+        nvtx.range_pop()
+        ########################################################################
+        # NOTE: Correctness
+        if hidden_states_ori_all is not None:
+            wrong_token_ids = find_rows_with_large_diff(hidden_states_ori_all, hidden_states, threshold=0.1, min_count=1)
+            wrong_hidden_states = hidden_states[wrong_token_ids]
+            true_hidden_states = hidden_states_ori_all[wrong_token_ids]
+            if self.local_dp_rank == 0:
+                logger.info(f"forward_mid_first, wrong_token_ids({wrong_token_ids.shape}): {wrong_token_ids}")
+
+        ########################################################################
+        nvtx.range_push("Postprocess_first")
+        ########################################################################
+        # NOTE: Post-processing => Reduce the first dimension
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+        ########################################################################
+
+        torch.cuda.current_stream().wait_stream(prefetch_build_stream)
+        torch.cuda.current_stream().wait_stream(prefetch_exec_w1_stream)
+        torch.cuda.current_stream().wait_stream(prefetch_exec_w2_stream)
+
+        nvtx.range_pop()
+        nvtx.range_pop()
+
+        return (
+            hidden_states, 
+            residual, 
+            recv_experts_next_cur_rank_tensor, 
+            recv_experts_next_cur_rank_tensor_cpu, 
+            recv_num_experts_next,
+            next_expert_gpu_mapping,
+            next_remote_gpu_expert_load,
+        )
+
+
+    def forward_mid(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        hidden_states_ori_all: Optional[torch.Tensor],
+        # CUDA Stream
+        rebalance_stream: torch.Stream, 
+        prefetch_original_stream: torch.Stream, 
+        prefetch_build_stream: torch.Stream, 
+        prefetch_exec_w1_stream: torch.Stream, 
+        prefetch_exec_w2_stream: torch.Stream, 
+        dispatch_stream: torch.Stream, 
+        output_stream: torch.Stream, 
+        next_gate: Optional[torch.nn.Module],
+        next_w13_weight: Optional[torch.Tensor], 
+        next_w2_weight: Optional[torch.Tensor], 
+        w13_weight_buf_odd: Optional[torch.Tensor], 
+        w2_weight_buf_odd: Optional[torch.Tensor], 
+        w13_weight_buf_even: Optional[torch.Tensor], 
+        w2_weight_buf_even: Optional[torch.Tensor], 
+        w13_weight_hdl_odd: Any, 
+        w2_weight_hdl_odd: Any, 
+        w13_weight_hdl_even: Any, 
+        w2_weight_hdl_even: Any, 
+        next_topk_ids_cpu: Optional[torch.Tensor],
+        topk_ids_cpu: Optional[torch.Tensor],
+        topk_ids_mask: Optional[torch.Tensor],
+        topk_ids_mask_cpu: Optional[torch.Tensor],
+        send_map_local: Optional[torch.Tensor],
+        send_map_local_gpu: Optional[torch.Tensor],
+        send_map_local_len: Optional[torch.Tensor],
+        recv_map_local_len: Optional[torch.Tensor],
+        # Prefetch info
+        recv_experts_cur_rank_tensor: Optional[torch.Tensor],
+        recv_experts_cur_rank_tensor_cpu: Optional[torch.Tensor],
+        recv_num_experts: int,
+        expert_gpu_mapping: Optional[torch.Tensor],
+        remote_gpu_expert_load: Optional[torch.Tensor],
+        topk_ids_buf: torch.Tensor,
+        topk_weights_buf: torch.Tensor,
+        next_topk_ids_buf: torch.Tensor,
+        topk_ids_hdl: Any,
+        topk_weights_hdl: Any,
+        next_topk_ids_hdl: Any,
+        hidden_states_for_prefetch_rebalance: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        nvtx.range_push("forward_mid")
+        nvtx.range_push("RMSNorm")
+        ########################################################################
+        
+        # CUDA Events
+        attn_start_1_event = torch.cuda.Event()
+        attn_start_2_event = torch.cuda.Event()
+        attn_done_event = torch.cuda.Event()
+        moe_local_done_event = torch.cuda.Event()
+        moe_remote_done_event = torch.cuda.Event()
+        prefetch_start_event = torch.cuda.Event()
+        prefetch_done_event = torch.cuda.Event()
+        dispatch_start_event = torch.cuda.Event()
+        dispatch_done_event = torch.cuda.Event()
+        output_done_event = torch.cuda.Event()
+        local_topk_done_event = torch.cuda.Event()
+        broadcast_done_event = torch.cuda.Event()
+
+        hidden_states_device = hidden_states.device
+        
+        local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
+        zero_offset = torch.zeros(
+            (), device=hidden_states_device, dtype=torch.int32
+        )
+        topk_ids_mask_cpu.fill_(0)
+        
+
+        ########################################################################
+
+        ########################################################################
+        # NOTE: Update the expert_map_gpu
+        if recv_experts_cur_rank_tensor_cpu is not None:
+            self.mlp.experts.expert_map_gpu_extended.copy_(self.mlp.experts.expert_map_gpu)
+            new_local_ids = torch.arange(
+                self.mlp.experts.num_local_experts, 
+                self.mlp.experts.num_local_experts + recv_experts_cur_rank_tensor_cpu.numel(), 
+                device=hidden_states_device, 
+                dtype=self.mlp.experts.expert_map_gpu.dtype
+            )
+            self.mlp.experts.expert_map_gpu_extended[recv_experts_cur_rank_tensor] = new_local_ids
+        ########################################################################
+
+        ########################################################################
+        # NOTE: RMSNorm + Attention
+        attn_start_1_event.record()
+        # prepare_attn => input_layernorm
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
+        nvtx.range_pop()
+        nvtx.range_push("Attention")
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                event=attn_start_1_event,
+            )
+        attn_done_event.record()
+        nvtx.range_pop()
+        ########################################################################
+        
+        ########################################################################
+        # NOTE: Dispatch
+        with torch.cuda.stream(dispatch_stream):
+            dispatch_stream.wait_event(attn_done_event)
+            nvtx.range_push("Dispatch")
+            # Residual connection
+            hidden_states += residual
+            local_hidden_states = hidden_states.detach().clone()
+
+            # RMSNorm
+            local_hidden_states = self.layer_communicator.post_attention_layernorm(local_hidden_states)
+
+            # router_logits: (num_tokens, n_experts)
+            local_router_logits, _ = self.mlp.gate(local_hidden_states)
+            local_topk_output = self.mlp.topk(local_hidden_states, local_router_logits)
+            topk_ids_buf.copy_(local_topk_output.topk_ids)
+            topk_weights_buf.copy_(local_topk_output.topk_weights)
+            if next_gate is not None:
+                next_router_logits, _ = next_gate(local_hidden_states)
+                next_topk_output = self.mlp.topk(local_hidden_states, next_router_logits)
+                next_topk_ids_buf.copy_(next_topk_output.topk_ids)
+            dispatch_start_event.record()
+
+            # Dispatch and post_attention_layernorm
+            hidden_states, residual = self.layer_communicator.prepare_mlp( 
+                hidden_states, residual, forward_batch
+            )
+            hidden_states_for_prefetch_rebalance.copy_(hidden_states)
+            dispatch_done_event.record()
+            nvtx.range_pop()
+        ########################################################################
+
+        ########################################################################
+        # NOTE: MoE_local
+        torch.cuda.current_stream().wait_event(dispatch_start_event)
+        nvtx.range_push("MoE Local")
+        if self.imbalance_ratio:
+            local_topk_ids_processed = self.mlp.experts.expert_map_gpu_extended[local_topk_output.topk_ids]
+            num_local_topk_ids_processed = (local_topk_ids_processed > -1).sum()
+        local_hidden_states = self.mlp(local_hidden_states, 
+                                forward_batch, 
+                                is_ours=True, 
+                                topk_ids_mask=None, 
+                                w1_buf=w13_weight_buf_even if self.layer_id % 2 == 0 else w13_weight_buf_odd,
+                                w2_buf=w2_weight_buf_even if self.layer_id % 2 == 0 else w2_weight_buf_odd,
+                                topk_output=local_topk_output
+                            )
+        moe_local_done_event.record()
+        ########################################################################
+        nvtx.range_pop()
+        ########################################################################
+        # NOTE: Rebalancer + MoE_remote
+        with torch.cuda.stream(rebalance_stream):
+            # Rebalance: adaptive token sharding of the remote tokens (CPU)
+            rebalance_stream.wait_event(dispatch_start_event)
+            # All-gather the routing results (and the next-layer prediction) of all ranks
+            if next_gate is None:
+                topk_ids, topk_weights = broadcast_topk(
+                    topk_ids_buf=topk_ids_buf,
+                    topk_weights_buf=topk_weights_buf,
+                    topk_ids_hdl=topk_ids_hdl,
+                    topk_weights_hdl=topk_weights_hdl,
+                    tp_rank=self.local_dp_rank,
+                    tp_size=self.local_dp_size,
+                    topk=self.mlp.experts.top_k,
+                    stream=rebalance_stream,
+                    device=hidden_states_device
+                )
+            else:
+                topk_ids, topk_weights, next_topk_ids = broadcast_topk_with_next(
+                    topk_ids_buf=topk_ids_buf,
+                    topk_weights_buf=topk_weights_buf,
+                    next_topk_ids_buf=next_topk_ids_buf,
+                    topk_ids_hdl=topk_ids_hdl,
+                    topk_weights_hdl=topk_weights_hdl,
+                    next_topk_ids_hdl=next_topk_ids_hdl,
+                    tp_rank=self.local_dp_rank,
+                    tp_size=self.local_dp_size,
+                    topk=self.mlp.experts.top_k,
+                    stream=rebalance_stream,
+                    device=hidden_states_device
+                )
+                # Asynchronous D2H copy
+                next_topk_ids_cpu.copy_(next_topk_ids, non_blocking=True)
+            broadcast_done_event.record()
+            topk_output = StandardTopKOutput(topk_ids=topk_ids, topk_weights=topk_weights, router_logits=None)
+            # WARNING: D2H with sync
+            topk_ids_cpu.copy_(topk_ids, non_blocking=False)
+
+
+            rebalance(
+                topk_ids=topk_ids_cpu,
+                expert_gpu_mapping=expert_gpu_mapping,
+                init_remote_gpu_expert_load=remote_gpu_expert_load,
+                num_experts=self.mlp.experts.num_experts,
+                seq_len=local_hidden_states.shape[0],
+                num_gpus=self.local_dp_size,
+                cur_rank=self.local_dp_rank,
+                topk_ids_mask_out=topk_ids_mask_cpu,
+                min_dup_experts_tokens=MIN_TOKEN_LIMIT
+            )
+            # Asynchronous H2D copy of the mask
+            topk_ids_mask.copy_(topk_ids_mask_cpu, non_blocking=True)
+
+            # MoE_remote
+            rebalance_stream.wait_event(moe_local_done_event)
+            rebalance_stream.wait_event(dispatch_done_event)
+            nvtx.range_push("MoE Remote")
+
+            if self.imbalance_ratio and self.local_dp_rank == 0:
+                logger.info(f'======================Layer: {self.layer_id}==========================')
+            if self.imbalance_ratio:
+                remote_topk_ids_processed = self.mlp.experts.expert_map_gpu_extended[topk_output.topk_ids]
+                remote_topk_ids_processed = remote_topk_ids_processed.masked_fill(topk_ids_mask == 0, -1)
+                num_remote_topk_ids_processed = (remote_topk_ids_processed > -1).sum()
+                num_remote_topk_ids_processed += num_local_topk_ids_processed
+
+                num_total = topk_output.topk_ids.numel()
+
+                #######################################
+                # Compare number of local tokens
+                original_topk_ids_processed = self.mlp.experts.expert_map_gpu[topk_output.topk_ids]
+                num_original_topk_ids_processed = (original_topk_ids_processed > -1).sum()
+                original_local_topk_ids_processed = original_topk_ids_processed[self.local_dp_rank * local_hidden_states.shape[0]: (self.local_dp_rank+1)
+                                                                                * local_hidden_states.shape[0]]
+                num_original_local_topk_ids_processed = (original_local_topk_ids_processed > -1).sum()
+
+                wrong_local_ids = find_rows_with_large_diff(local_topk_ids_processed, original_local_topk_ids_processed, threshold=0.1, min_count=1)
+                ori_ids = original_local_topk_ids_processed[wrong_local_ids]
+                wrong_ids = local_topk_ids_processed[wrong_local_ids]
+                if self.local_dp_rank == 0:
+                    logger.info(f"wrong_local_ids({wrong_local_ids.shape}): {wrong_local_ids}")
+                    logger.info(f"ori_ids({ori_ids.shape}): {ori_ids}")
+                    logger.info(f"wrong_ids({wrong_ids.shape}): {wrong_ids}")
+
+                #######################################
+
+                assert num_remote_topk_ids_processed == num_original_topk_ids_processed, "Processed number of tokens must be equal"
+            remote_hidden_states_ours = self.mlp(hidden_states_for_prefetch_rebalance, 
+                                                    forward_batch, 
+                                                    is_ours=True, 
+                                                    topk_ids_mask=topk_ids_mask, 
+                                                    w1_buf=w13_weight_buf_even if self.layer_id % 2 == 0 else w13_weight_buf_odd,
+                                                    w2_buf=w2_weight_buf_even if self.layer_id % 2 == 0 else w2_weight_buf_odd,
+                                                    topk_output=topk_output
+                                                )
+            moe_remote_done_event.record()
+            nvtx.range_pop()
+
+        ########################################################################
+
+        ########################################################################
+        # NOTE: Prefetch => Build Plans for w2 and w13
+        with torch.cuda.stream(prefetch_build_stream):
+            prefetch_build_stream.wait_event(broadcast_done_event)
+            prefetch_build_stream.wait_event(dispatch_done_event)
+            nvtx.range_push("Prefetch")
+            recv_experts_next_cur_rank_tensor = None
+            recv_experts_next_cur_rank_tensor_cpu = None
+            recv_num_experts_next = None
+            next_expert_gpu_mapping = None
+            next_remote_gpu_expert_load = None
+            if next_gate is not None:
+                next_expert_gpu_mapping, next_remote_gpu_expert_load, recv_experts_next_cur_rank_tensor_cpu = prefetch(
+                    next_topk_ids=next_topk_ids_cpu,
+                    num_experts=self.mlp.experts.num_experts,
+                    seq_len=hidden_states_for_prefetch_rebalance.shape[0] // self.local_dp_size,
+                    num_gpus=self.local_dp_size,
+                    cur_rank=self.local_dp_rank,
+                    send_map_local_out=send_map_local,
+                    send_map_local_len_out=send_map_local_len,
+                    recv_map_local_len_out=recv_map_local_len,
+                    max_dup_per_gpu=EXPERT_DUP_FACTOR_N,
+                    n_local_dup_per_gpu=EXPERT_DUP_FACTOR_L,
+                    max_send_len=EXPERT_DUP_MAX,
+                    force_max_dup=False
+                )
+
+                recv_num_experts_next = recv_experts_next_cur_rank_tensor_cpu.numel()
+                # WARNING: H2D Sync
+                recv_experts_next_cur_rank_tensor = recv_experts_next_cur_rank_tensor_cpu.to(hidden_states_for_prefetch_rebalance.device)
+
+                # Build P2P plans for w13 and w2
+                cum = compute_cum_recv_map_len(recv_map_local_len)
+                prefetch_plan = P2PPlan(
+                    w13_weight=next_w13_weight,
+                    w2_weight=next_w2_weight,
+                    w13_weight_hdl=w13_weight_hdl_odd if self.layer_id % 2 == 0 else w13_weight_hdl_even,
+                    w2_weight_hdl=w2_weight_hdl_odd if self.layer_id % 2 == 0 else w2_weight_hdl_even,
+                    send_map=send_map_local.clone(),
+                    send_map_len=send_map_local_len.clone(),
+                    recv_map_len=recv_map_local_len.clone(),
+                    cum_recv_map_len=cum,
+                    dp_size=self.local_dp_size,
+                    dp_rank=self.local_dp_rank,
+                    w13_weight_buf_shape=w13_weight_buf_even.shape,
+                    w2_weight_buf_shape=w2_weight_buf_even.shape
+                )
+                num_ori_experts = self.mlp.experts.num_local_experts
+                for i in range(prefetch_plan.dp_size):
+                    rows = int(prefetch_plan.send_map_len[self.local_dp_rank, i].item())
+                    if rows == 0 or i == self.local_dp_rank:
+                        continue
+                    dst_off = int(prefetch_plan.cum_recv_map_len[i, self.local_dp_rank].item())
+                    for k in range(rows):
+                        expert_id = int(prefetch_plan.send_map[self.local_dp_rank, i, k].item())
+                        # 1-row view [1, D]
+                        src_w13_row = prefetch_plan.w13_weight.narrow(0, expert_id, 1)
+                        src_w2_row = prefetch_plan.w2_weight.narrow(0, expert_id, 1)
+                        peer_w13_buf = prefetch_plan.w13_weight_hdl.get_buffer(
+                            i, 
+                            prefetch_plan.w13_weight_buf_shape, 
+                            dtype=prefetch_plan.w13_weight.dtype
+                        )
+                        peer_w2_buf = prefetch_plan.w2_weight_hdl.get_buffer(
+                            i, 
+                            prefetch_plan.w2_weight_buf_shape, 
+                            dtype=prefetch_plan.w2_weight.dtype
+                        )
+                        peer_w13_buf.narrow(0, num_ori_experts + dst_off + k, 1).copy_(src_w13_row)
+                        peer_w2_buf.narrow(0, num_ori_experts + dst_off + k, 1).copy_(src_w2_row)
+        ########################################################################
+
+        ########################################################################
+        # NOTE: Add outputs/Combine
+        torch.cuda.current_stream().wait_stream(rebalance_stream)
+        torch.cuda.current_stream().wait_stream(dispatch_stream)
+        torch.cuda.current_stream().wait_stream(prefetch_exec_w1_stream)
+        torch.cuda.current_stream().wait_stream(prefetch_exec_w2_stream)
+        nvtx.range_pop()
+        nvtx.range_push("Combine")
+
+        # Combine outputs of local tokens and remote tokens
+        hidden_states = fused_add_without_zero_init_v2(
+            hidden_states=hidden_states, 
+            local_hidden_states=local_hidden_states, 
+            remote_hidden_states_ours=remote_hidden_states_ours, 
+            zero_offset=zero_offset,
+            local_start_pos=local_start_pos,
+            local_num_tokens=local_num_tokens
+        )
+        output_done_event.record()
+
+        if self.local_dp_size > 1:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        ########################################################################
+        nvtx.range_pop()
+        nvtx.range_push("Copy Buffer")
+        ########################################################################
+        # NOTE: Copy the original weights to large buffers
+        with torch.cuda.stream(prefetch_original_stream):
+            if next_gate is not None:
+                assert w13_weight_buf_odd.is_contiguous(), "w13_weight_buf_odd is not contiguous"
+                assert w2_weight_buf_odd.is_contiguous(), "w2_weight_buf_odd is not contiguous"
+                assert w13_weight_buf_even.is_contiguous(), "w13_weight_buf_even is not contiguous"
+                assert w2_weight_buf_even.is_contiguous(), "w2_weight_buf_even is not contiguous"
+                # Stage the next layer's resident experts in rows [0:num_rows) of the other-parity buffer (row 0 first, then the rest).
+                num_rows = next_w13_weight.shape[0]
+                prefetch_original_stream.wait_event(output_done_event)
+                step = 1
+                if self.layer_id % 2 == 0:
+                    w13_weight_buf_odd[:step].copy_(next_w13_weight[:step])
+                    w13_weight_buf_odd[step:num_rows].copy_(next_w13_weight[step:num_rows])
+                    w2_weight_buf_odd[:step].copy_(next_w2_weight[:step])
+                    w2_weight_buf_odd[step:num_rows].copy_(next_w2_weight[step:num_rows])
+                else:
+                    w13_weight_buf_even[:step].copy_(next_w13_weight[:step])
+                    w13_weight_buf_even[step:num_rows].copy_(next_w13_weight[step:num_rows])
+                    w2_weight_buf_even[:step].copy_(next_w2_weight[:step])
+                    w2_weight_buf_even[step:num_rows].copy_(next_w2_weight[step:num_rows])
+        ########################################################################
+        nvtx.range_pop()
+        nvtx.range_push("Postprocess")
+        ########################################################################
+        # NOTE: Correctness
+        if hidden_states_ori_all is not None:
+            wrong_token_ids = find_rows_with_large_diff(hidden_states_ori_all, hidden_states, threshold=0.1, min_count=1)
+            wrong_hidden_states = hidden_states[wrong_token_ids]
+            true_hidden_states = hidden_states_ori_all[wrong_token_ids]
+            if self.local_dp_rank == 0:
+                logger.info(f"wrong_hidden_states({wrong_hidden_states.shape}): {wrong_hidden_states}")
+                logger.info(f"true_hidden_states({true_hidden_states.shape}): {true_hidden_states}")
+        ########################################################################
+
+        ########################################################################
+        # NOTE: Post-processing
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+        ########################################################################
+
+        torch.cuda.current_stream().wait_stream(prefetch_build_stream)
+        torch.cuda.current_stream().wait_stream(prefetch_exec_w1_stream)
+        torch.cuda.current_stream().wait_stream(prefetch_exec_w2_stream)
+
+        nvtx.range_pop()
+        nvtx.range_pop()
+
+        return (
+            hidden_states, 
+            residual, 
+            recv_experts_next_cur_rank_tensor, 
+            recv_experts_next_cur_rank_tensor_cpu, 
+            recv_num_experts_next,
+            next_expert_gpu_mapping,
+            next_remote_gpu_expert_load,
+        )
 
     def op_comm_prepare_attn(
         self,
@@ -608,6 +1719,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
 
 class Qwen3MoeModel(Qwen2MoeModel):
+
     def __init__(
         self,
         config: Qwen3MoeConfig,

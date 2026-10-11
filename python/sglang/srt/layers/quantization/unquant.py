@@ -1,3 +1,4 @@
+# Modified from SGLang v0.4.10 (https://github.com/sgl-project/sglang) for Libra (ICLR 2026).
 from __future__ import annotations
 
 import importlib
@@ -21,6 +22,9 @@ from sglang.srt.utils import (
     is_hip,
     set_weight_attrs,
     use_intel_amx_backend,
+)
+from sglang.srt.layers.dp_attention import (
+    get_local_attention_dp_rank
 )
 
 if TYPE_CHECKING:
@@ -138,6 +142,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
             self.triton_kernel_moe_forward = _tk_forward
 
+        self.local_dp_rank = get_local_attention_dp_rank()
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -202,6 +208,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
+        w1_buf: torch.Tensor = None,
+        w2_buf: torch.Tensor = None,
     ) -> torch.Tensor:
 
         return self.forward(
@@ -213,6 +221,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             inplace=inplace,
             no_combine=no_combine,
             routed_scaling_factor=routed_scaling_factor,
+            w1_buf=w1_buf,
+            w2_buf=w2_buf,
         )
 
     def forward_cuda(
@@ -226,6 +236,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
+        w1_buf: torch.Tensor = None,
+        w2_buf: torch.Tensor = None,
     ) -> torch.Tensor:
 
         if self.use_triton_kernels:
@@ -270,14 +282,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
                 return fused_experts(
                     hidden_states=x,
-                    w1=layer.w13_weight,
-                    w2=layer.w2_weight,
+                    w1=w1_buf if w1_buf is not None else layer.w13_weight,
+                    w2=w2_buf if w2_buf is not None else layer.w2_weight,
                     topk_output=topk_output,
                     inplace=inplace and not no_combine,
                     activation=activation,
                     apply_router_weight_on_input=apply_router_weight_on_input,
                     no_combine=no_combine,
                     routed_scaling_factor=routed_scaling_factor,
+                    local_dp_rank=self.local_dp_rank,
                 )
 
     def forward_cpu(

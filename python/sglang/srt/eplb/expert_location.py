@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# Modified from SGLang v0.4.10 (https://github.com/sgl-project/sglang) for Libra (ICLR 2026).
 import json
 import logging
 import random
@@ -443,9 +444,10 @@ def compute_initial_expert_location_metadata(
         logger.info(
             "init_expert_location from init_by_mapping using ServerArgs.init_expert_location"
         )
-        return ExpertLocationMetadata.init_by_mapping(
+        mapping = ExpertLocationMetadata.init_by_mapping(
             server_args, model_config, **data_dict
         )
+        return mapping
     elif "logical_count" in data_dict:
         logger.info(
             "init_expert_location from init_by_eplb using ServerArgs.init_expert_location"

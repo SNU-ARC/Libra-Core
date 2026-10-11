@@ -235,3 +235,17 @@ compile_commands.json
 Cargo.lock
 
 lmms-eval
+
+profile_logs
+deepseek-v3-results
+nsys_profile_logs
+DeepEP
+nvshmem*
+triton_cache*
+python/sglang/load_balance/*.c
+test.py
+
+# Libra experiment outputs
+latency_throughput/
+eplb/hot_experts/
+eplb/expert_placement/

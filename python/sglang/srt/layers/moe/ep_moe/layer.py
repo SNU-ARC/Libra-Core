@@ -1,3 +1,4 @@
+# Modified from SGLang v0.4.10 (https://github.com/sgl-project/sglang) for Libra (ICLR 2026).
 from __future__ import annotations
 
 import logging
@@ -50,6 +51,9 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     next_power_of_2,
+)
+from sglang.srt.layers.dp_attention import (
+    get_local_attention_dp_rank
 )
 
 if TYPE_CHECKING:
@@ -156,11 +160,26 @@ class EPMoE(FusedMoE):
             self.block_shape = None
             self.activation_scheme = None
 
-    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        self.local_dp_rank = get_local_attention_dp_rank()
+
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            topk_output: TopKOutput,
+            topk_ids_mask: torch.Tensor = None,
+            w1_buf: torch.Tensor = None,
+            w2_buf: torch.Tensor = None,
+        ):
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
             return self.forward_deepgemm(hidden_states, topk_output)
         else:
-            return super().forward(hidden_states, topk_output)
+            return super().forward(
+                hidden_states,
+                topk_output,
+                topk_ids_mask=topk_ids_mask,
+                w1_buf=w1_buf,
+                w2_buf=w2_buf,
+            )
 
     def forward_deepgemm(
         self,

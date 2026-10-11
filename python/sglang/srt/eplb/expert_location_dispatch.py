@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# Modified from SGLang v0.4.10 (https://github.com/sgl-project/sglang) for Libra (ICLR 2026).
 
 from dataclasses import dataclass
 from typing import Literal, Optional
@@ -19,6 +20,8 @@ import torch
 
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+
+import random
 
 
 @dataclass
@@ -66,6 +69,7 @@ def transform_select_experts_inputs(
     correction_bias: Optional[torch.Tensor],
     info: Optional[ExpertLocationDispatchInfo],
 ):
+    random.seed(0)
     if (info is not None) and (info.ep_dispatch_algorithm == "fake"):
         router_logits.uniform_(5, 10)
         if correction_bias is not None:
@@ -98,6 +102,8 @@ def _topk_ids_logical_to_physical_dynamic(
     topk_ids_original_shape = topk_ids.shape
     device = topk_ids.device
     topk_ids = topk_ids.flatten()
+
+    random.seed(0)
 
     chosen_dispatch_index = (
         torch.randint(0, 65536, topk_ids.shape, dtype=torch.int32, device=device)

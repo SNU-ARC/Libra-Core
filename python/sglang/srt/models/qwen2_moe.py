@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# Modified from SGLang v0.4.10 (https://github.com/sgl-project/sglang) for Libra (ICLR 2026).
 
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen2_moe.py
@@ -71,6 +72,20 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import add_prefix, make_layers
+
+
+import os
+from sglang.srt.layers.dp_attention import (
+    get_dp_local_info,
+    get_local_attention_dp_rank
+)
+from sglang.srt.utils import (
+    EXPERT_DUP_FACTOR_N,
+    create_large_buffer_symm
+)
+import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
+from collections import deque
 
 logger = logging.getLogger(__name__)
 
@@ -395,6 +410,15 @@ class Qwen2MoeDecoderLayer(nn.Module):
 
         return hidden_states, residual
 
+# Replication plan computed in layer i for layer i + 1 (handed over by Qwen2MoeModel.forward)
+@dataclass
+class NextTwoPrefetchInfo:
+    recv_experts_next_cur_rank_tensor: torch.Tensor | None
+    recv_experts_next_cur_rank_tensor_cpu: torch.Tensor | None
+    recv_num_experts_next: int | None
+    next_expert_gpu_mapping: torch.Tensor | None
+    next_remote_gpu_expert_load: torch.Tensor | None
+
 
 class Qwen2MoeModel(nn.Module):
     def __init__(
@@ -443,6 +467,53 @@ class Qwen2MoeModel(nn.Module):
 
         # For EAGLE3 support
         self.layers_to_capture = []
+        
+        # Common
+        self.tp_size = get_local_attention_dp_size()
+        self.tp_rank = get_local_attention_dp_rank()
+        # CUDA Streams
+        self.rebalance_stream = torch.cuda.Stream(priority=-3)
+        self.prefetch_original_stream = torch.cuda.Stream(priority=-1)
+        self.prefetch_build_stream = torch.cuda.Stream(priority=-6)
+        self.prefetch_exec_w1_stream = torch.cuda.Stream(priority=-6)
+        self.prefetch_exec_w2_stream = torch.cuda.Stream(priority=-1)
+        self.dispatch_stream = torch.cuda.Stream(priority=-2)
+        self.output_stream = torch.cuda.Stream(priority=-4)
+        # Large expert-weight buffers for FusedMoE: resident experts + EXPERT_DUP_FACTOR_N replica slots
+        # Odd layers => odd buffers are used and even buffers are prefetched
+        # Even layers => even buffers are used and odd buffers are prefetched
+        # Layer whose expert weights serve as the shape template for the buffers
+        temp_idx = 3
+        self.w13_weight_buf_odd, self.w13_weight_hdl_odd = create_large_buffer_symm(
+            self.layers[temp_idx].mlp.experts.w13_weight.data, 
+            EXPERT_DUP_FACTOR_N
+        )
+        self.w2_weight_buf_odd, self.w2_weight_hdl_odd = create_large_buffer_symm(
+            self.layers[temp_idx].mlp.experts.w2_weight.data, 
+            EXPERT_DUP_FACTOR_N
+        )
+        self.w13_weight_buf_even, self.w13_weight_hdl_even = create_large_buffer_symm(
+            self.layers[temp_idx].mlp.experts.w13_weight.data, 
+            EXPERT_DUP_FACTOR_N
+        )
+        self.w2_weight_buf_even, self.w2_weight_hdl_even = create_large_buffer_symm(
+            self.layers[temp_idx].mlp.experts.w2_weight.data, 
+            EXPERT_DUP_FACTOR_N
+        )
+        # Symmetric buffers used to exchange the per-rank routing results
+        topk = 8
+        # NOTE: must equal the number of tokens per rank (SEQ_LENS_SUM, exported by the launcher)
+        seq_lens_sum = int(os.getenv("SEQ_LENS_SUM", 4096))
+
+        self.topk_ids_buf = symm_mem.empty((seq_lens_sum,  topk), dtype=torch.int32, device="cuda")
+        self.topk_weights_buf = symm_mem.empty((seq_lens_sum, topk), dtype=torch.float32, device="cuda")
+        self.next_topk_ids_buf = symm_mem.empty((seq_lens_sum,  topk), dtype=torch.int32, device="cuda")
+        self.topk_ids_hdl = symm_mem.rendezvous(self.topk_ids_buf, dist.group.WORLD)
+        self.topk_weights_hdl = symm_mem.rendezvous(self.topk_weights_buf, dist.group.WORLD)
+        self.next_topk_ids_hdl = symm_mem.rendezvous(self.next_topk_ids_buf, dist.group.WORLD)
+
+        # Buffer for prefetch and rebalance
+        self.hidden_states_for_prefetch_rebalance = None
 
     def forward(
         self,
@@ -475,6 +546,74 @@ class Qwen2MoeModel(nn.Module):
                 residual=residual,
             )
         else:
+            
+            # For local/remote split
+            hidden_states_dtype = hidden_states.dtype
+            hidden_states_device = hidden_states.device
+            global_num_tokens = torch.sum(forward_batch.global_num_tokens_gpu)
+            _, local_num_tokens = get_dp_local_info(forward_batch)
+            # For Prefetcher
+            topk = 8
+            self.next_topk_ids_cpu = torch.empty(
+                (forward_batch.seq_lens_sum * self.tp_size, topk),
+                device=torch.device("cpu"),
+                pin_memory=True,
+                dtype=torch.int64,
+            )
+            self.send_map_local = torch.empty(
+                (self.tp_size, self.tp_size, EXPERT_DUP_FACTOR_N),
+                dtype=torch.int64,
+                device=torch.device("cpu"),
+                pin_memory=True,
+            )
+            self.send_map_local_gpu = torch.empty(
+                (self.tp_size, self.tp_size, EXPERT_DUP_FACTOR_N),
+                dtype=torch.int64,
+                device=hidden_states_device,
+            )
+            self.send_map_local_len = torch.empty(
+                (self.tp_size, self.tp_size),
+                dtype=torch.int64,
+                device=torch.device("cpu"),
+            )
+            self.recv_map_local_len = torch.empty(
+                (self.tp_size, self.tp_size),
+                dtype=torch.int64,
+                device=torch.device("cpu"),
+            )
+            self.hidden_states_for_prefetch_rebalance = torch.empty(
+                (forward_batch.seq_lens_sum * self.tp_size, hidden_states.size(1)),
+                dtype=hidden_states_dtype,
+                device=hidden_states_device,
+            )
+            # For Rebalancer
+            self.topk_ids_cpu = torch.empty(
+                (forward_batch.seq_lens_sum * self.tp_size, topk),
+                device=torch.device("cpu"),
+                pin_memory=True,
+                dtype=torch.int64,
+            )
+            self.topk_ids_mask = torch.empty(
+                (forward_batch.seq_lens_sum * self.tp_size, topk),
+                device=hidden_states_device,
+                dtype=torch.int64,
+            )
+            self.topk_ids_mask_cpu = torch.empty(
+                (forward_batch.seq_lens_sum * self.tp_size, topk),
+                device=torch.device("cpu"),
+                pin_memory=True,
+                dtype=torch.int64,
+            )
+            # Next layer
+            q_len = 1
+            prefetch_q: deque[NextTwoPrefetchInfo] = deque(maxlen=q_len)
+            recv_experts_next_cur_rank_tensor = None
+            recv_experts_next_cur_rank_tensor_cpu = None 
+            recv_num_experts_next = None
+            next_expert_gpu_mapping = None
+            next_remote_gpu_expert_load = None
+            prefetch_plan = None
+
             for i in range(self.start_layer, self.end_layer):
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(
@@ -484,9 +623,88 @@ class Qwen2MoeModel(nn.Module):
                     )
                 with get_global_expert_distribution_recorder().with_current_layer(i):
                     layer = self.layers[i]
-                    hidden_states, residual = layer(
-                        positions, hidden_states, forward_batch, residual
+
+                    
+                    if len(prefetch_q) >= q_len:  # plan produced by the previous layer
+                        prefetch_info = prefetch_q.popleft()
+                    else:  # first layer: no plan yet
+                        prefetch_info = NextTwoPrefetchInfo(*(None,)*5)
+
+                    
+                    next_gate = None
+                    next_w13_weight = None
+                    next_w2_weight = None
+                    target_layer_id = i + q_len
+                    if target_layer_id < self.end_layer:
+                        next_gate = self.layers[target_layer_id].mlp.gate
+                        next_w13_weight = self.layers[target_layer_id].mlp.experts.w13_weight.data
+                        next_w2_weight = self.layers[target_layer_id].mlp.experts.w2_weight.data
+                    (
+                        hidden_states, 
+                        residual, 
+                        recv_experts_next_cur_rank_tensor, 
+                        recv_experts_next_cur_rank_tensor_cpu, 
+                        recv_num_experts_next,
+                        next_expert_gpu_mapping,
+                        next_remote_gpu_expert_load,
+                    ) = layer(
+                        positions=positions, 
+                        hidden_states=hidden_states, 
+                        forward_batch=forward_batch, 
+                        residual=residual,
+                        rebalance_stream=self.rebalance_stream, 
+                        prefetch_original_stream=self.prefetch_original_stream, 
+                        prefetch_build_stream=self.prefetch_build_stream, 
+                        prefetch_exec_w1_stream=self.prefetch_exec_w1_stream, 
+                        prefetch_exec_w2_stream=self.prefetch_exec_w2_stream, 
+                        dispatch_stream=self.dispatch_stream, 
+                        output_stream=self.output_stream, 
+                        # Prefetcher
+                        next_gate=next_gate,
+                        next_w13_weight=next_w13_weight,
+                        next_w2_weight=next_w2_weight,
+                        # MoE computation buffers
+                        w13_weight_buf_odd=self.w13_weight_buf_odd,
+                        w2_weight_buf_odd=self.w2_weight_buf_odd,
+                        w13_weight_buf_even=self.w13_weight_buf_even,
+                        w2_weight_buf_even=self.w2_weight_buf_even,
+                        # MoE computation handlers
+                        w13_weight_hdl_odd=self.w13_weight_hdl_odd,
+                        w2_weight_hdl_odd=self.w2_weight_hdl_odd,
+                        w13_weight_hdl_even=self.w13_weight_hdl_even,
+                        w2_weight_hdl_even=self.w2_weight_hdl_even,
+                        next_topk_ids_cpu=self.next_topk_ids_cpu,
+                        topk_ids_cpu=self.topk_ids_cpu,
+                        topk_ids_mask=self.topk_ids_mask,
+                        topk_ids_mask_cpu=self.topk_ids_mask_cpu,
+                        send_map_local=self.send_map_local,
+                        send_map_local_gpu=self.send_map_local_gpu,
+                        send_map_local_len=self.send_map_local_len,
+                        recv_map_local_len=self.recv_map_local_len,
+                        recv_experts_cur_rank_tensor=prefetch_info.recv_experts_next_cur_rank_tensor, 
+                        recv_experts_cur_rank_tensor_cpu=prefetch_info.recv_experts_next_cur_rank_tensor_cpu, 
+                        recv_num_experts=prefetch_info.recv_num_experts_next,
+                        expert_gpu_mapping=prefetch_info.next_expert_gpu_mapping,
+                        remote_gpu_expert_load=prefetch_info.next_remote_gpu_expert_load,
+                        topk_ids_buf=self.topk_ids_buf,
+                        topk_weights_buf=self.topk_weights_buf,
+                        next_topk_ids_buf=self.next_topk_ids_buf,
+                        topk_ids_hdl=self.topk_ids_hdl,
+                        topk_weights_hdl=self.topk_weights_hdl,
+                        next_topk_ids_hdl=self.next_topk_ids_hdl,
+                        hidden_states_for_prefetch_rebalance=self.hidden_states_for_prefetch_rebalance,
+                        q_len=q_len,
                     )
+                    prefetch_q.append(
+                        NextTwoPrefetchInfo(
+                            recv_experts_next_cur_rank_tensor,
+                            recv_experts_next_cur_rank_tensor_cpu,
+                            recv_num_experts_next,
+                            next_expert_gpu_mapping,
+                            next_remote_gpu_expert_load,
+                        )
+                    )
+            prefetch_q.clear()
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {

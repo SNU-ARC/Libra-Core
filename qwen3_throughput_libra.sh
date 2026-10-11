@@ -1,0 +1,16 @@
+bash ./single_node_scripts/ep_test.sh Qwen3-235B-A22B 1024 2 EP bookcorpus train 0 1 800 1000 6 4 2048 libra
+bash ./single_node_scripts/ep_test.sh Qwen3-235B-A22B 1024 4 EP bookcorpus train 0 1 400 496 8 4 4096 libra
+bash ./single_node_scripts/ep_test.sh Qwen3-235B-A22B 1024 2 EP codeforces train 0 25 800 1000 6 4 2048 libra
+bash ./single_node_scripts/ep_test.sh Qwen3-235B-A22B 1024 4 EP codeforces train 0 25 400 496 8 4 4096 libra
+bash ./single_node_scripts/ep_test.sh Qwen3-235B-A22B 1024 2 EP deepseek_prover train 0 40 800 1000 6 4 2048 libra
+bash ./single_node_scripts/ep_test.sh Qwen3-235B-A22B 1024 4 EP deepseek_prover train 0 40 400 496 8 6 4096 libra
+bash ./single_node_scripts/ep_test.sh Qwen3-235B-A22B 1024 2 EP fineweb train 0 1 800 1000 6 4 2048 libra
+bash ./single_node_scripts/ep_test.sh Qwen3-235B-A22B 1024 4 EP fineweb train 0 1 400 496 8 4 4096 libra
+bash ./single_node_scripts/ep_test.sh Qwen3-235B-A22B 1024 2 EP gsm8k train 0 100 800 1000 6 4 2048 libra
+bash ./single_node_scripts/ep_test.sh Qwen3-235B-A22B 1024 4 EP gsm8k train 0 100 400 496 8 4 4096 libra
+bash ./single_node_scripts/ep_test.sh Qwen3-235B-A22B 1024 2 EP hellaswag train 0 45 800 1000 6 4 2048 libra
+bash ./single_node_scripts/ep_test.sh Qwen3-235B-A22B 1024 4 EP hellaswag train 0 45 400 496 8 4 4096 libra
+bash ./single_node_scripts/ep_test.sh Qwen3-235B-A22B 1024 2 EP humanevalplus train 0 25 800 1000 6 4 2048 libra
+bash ./single_node_scripts/ep_test.sh Qwen3-235B-A22B 1024 4 EP humanevalplus train 0 25 400 496 8 4 4096 libra
+bash ./single_node_scripts/ep_test.sh Qwen3-235B-A22B 1024 2 EP lmsys_chat_1m train 0 1 800 1000 6 4 2048 libra
+bash ./single_node_scripts/ep_test.sh Qwen3-235B-A22B 1024 4 EP lmsys_chat_1m train 0 1 400 496 8 4 4096 libra
