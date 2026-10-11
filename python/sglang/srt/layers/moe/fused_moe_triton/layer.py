@@ -1,4 +1,5 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
+# Modified from SGLang v0.4.10 (https://github.com/sgl-project/sglang) for Libra (ICLR 2026).
 
 import logging
 from enum import Enum
@@ -25,6 +26,9 @@ from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.utils import cpu_has_amx_support, get_bool_env_var, is_cpu, is_hip
+from sglang.srt.layers.dp_attention import (
+    get_local_attention_dp_rank
+)
 
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -96,6 +100,9 @@ class FusedMoE(torch.nn.Module):
         self.num_fused_shared_experts = num_fused_shared_experts
         self.expert_map_cpu = None
         self.expert_map_gpu = None
+        # Expert map used by forward(): a copy of expert_map_gpu to which the Libra decoder
+        # layers add the local slots of the replicated experts of the current layer
+        self.expert_map_gpu_extended = None
 
         if enable_flashinfer_cutlass_moe and quant_config is None:
             logger.warning("Disable flashinfer MoE when quantization config is None.")
@@ -120,6 +127,7 @@ class FusedMoE(torch.nn.Module):
                 * self.num_local_experts
             ] = torch.arange(0, self.num_local_experts, dtype=torch.int32, device="cpu")
             self.expert_map_gpu = self.expert_map_cpu.to(device="cuda")
+            self.expert_map_gpu_extended = self.expert_map_gpu.clone()
 
         self.routed_scaling_factor = routed_scaling_factor
         assert intermediate_size % self.moe_tp_size == 0
@@ -130,6 +138,8 @@ class FusedMoE(torch.nn.Module):
         self.use_presharded_weights = use_presharded_weights
         self.inplace = inplace
         self.no_combine = no_combine
+
+        self.local_dp_rank = get_local_attention_dp_rank()
 
         self.use_triton_kernels = (
             not _is_cpu and global_server_args_dict["enable_triton_kernel_moe"]
@@ -608,12 +618,25 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-    def forward(self, hidden_states: torch.Tensor, topk_output: StandardTopKOutput):
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            topk_output: StandardTopKOutput,
+            topk_ids_mask: torch.Tensor = None,
+            w1_buf: torch.Tensor = None,
+            w2_buf: torch.Tensor = None,
+        ):
         assert self.quant_method is not None
 
-        if self.expert_map_gpu is not None:
+        if self.expert_map_gpu_extended is not None:
             topk_output = topk_output._replace(
-                topk_ids=self.expert_map_gpu[topk_output.topk_ids]
+                topk_ids=self.expert_map_gpu_extended[topk_output.topk_ids]
+            )
+
+        # MoE_remote: drop the (token, expert) pairs that are not assigned to this rank
+        if topk_ids_mask is not None:
+            topk_output = topk_output._replace(
+                topk_ids=topk_output.topk_ids.masked_fill(topk_ids_mask == 0, -1),
             )
 
         # Matrix multiply.
@@ -624,6 +647,8 @@ class FusedMoE(torch.nn.Module):
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
             routed_scaling_factor=self.routed_scaling_factor,
+            w1_buf=w1_buf,
+            w2_buf=w2_buf,
             **(
                 dict(
                     tp_rank=self.moe_tp_rank,

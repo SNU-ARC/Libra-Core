@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# Modified from SGLang v0.4.10 (https://github.com/sgl-project/sglang) for Libra (ICLR 2026).
 
 from __future__ import annotations
 
@@ -343,6 +344,8 @@ def fused_topk(
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     M, _ = hidden_states.shape
+
+    gating_output = gating_output.to(torch.float32)
 
     topk_weights = torch.empty(
         M, topk, dtype=torch.float32, device=hidden_states.device

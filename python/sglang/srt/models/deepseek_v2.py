@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# Modified from SGLang v0.4.10 (https://github.com/sgl-project/sglang) for Libra (ICLR 2026).
 
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
@@ -112,6 +113,12 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     use_intel_amx_backend,
 )
+
+
+from sglang.srt.layers.moe.topk import TopKOutput
+
+
+from sglang.lina.lina_prefetch_route_v2 import Lina
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -308,14 +315,9 @@ class DeepseekV2MoE(nn.Module):
 
         self.topk = (
             TopK(
-                top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
-                renormalize=config.norm_topk_prob,
-                use_grouped_topk=True,
-                num_expert_group=config.n_group,
-                num_fused_shared_experts=self.num_fused_shared_experts,
-                topk_group=config.topk_group,
-                correction_bias=self.gate.e_score_correction_bias,
-                routed_scaling_factor=self.routed_scaling_factor,
+            top_k=config.num_experts_per_tok,
+            renormalize=config.norm_topk_prob,
+            use_grouped_topk=False,
             )
             if not use_flashinfer_trtllm_moe
             else None
@@ -449,6 +451,12 @@ class DeepseekV2MoE(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
         can_fuse_mlp_allreduce: bool = False,
+        is_ours: bool = False,
+        topk_ids_mask: torch.Tensor = None,
+        w1_buf: torch.Tensor = None,
+        w2_buf: torch.Tensor = None,
+        topk_output: TopKOutput = None,
+        lina: Optional[Lina] = None,
     ) -> torch.Tensor:
         if not self._enable_deepep_moe:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
@@ -461,9 +469,132 @@ class DeepseekV2MoE(nn.Module):
                     hidden_states, can_fuse_mlp_allreduce
                 )
             else:
-                return self.forward_normal(hidden_states, can_fuse_mlp_allreduce)
+                
+                if is_ours:
+                    return self.forward_normal_ours(
+                        hidden_states=hidden_states, 
+                        can_fuse_mlp_allreduce=can_fuse_mlp_allreduce,
+                        topk_ids_mask=topk_ids_mask,
+                        w1_buf=w1_buf,
+                        w2_buf=w2_buf,
+                        topk_output=topk_output,
+                    )
+                else:
+                    return self.forward_normal_ori(hidden_states, can_fuse_mlp_allreduce, lina=lina)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
+
+    
+    def forward_normal_ours(
+        self, 
+        hidden_states: torch.Tensor, 
+        can_fuse_mlp_allreduce: bool = False,
+        topk_ids_mask: torch.Tensor = None,
+        w1_buf: torch.Tensor = None,
+        w2_buf: torch.Tensor = None,
+        topk_output: TopKOutput = None,
+    ) -> torch.Tensor:
+        if hasattr(self, "shared_experts") and use_intel_amx_backend(
+            self.shared_experts.gate_up_proj
+        ):
+            return self.forward_cpu(hidden_states, can_fuse_mlp_allreduce)
+
+        ###############################################################
+        # NOTE: Shared expert computation
+        # Shared experts are computed only when topk_ids_mask is given (MoE_remote), not in the MoE_local pass
+        if topk_ids_mask is None: # MoE_local
+            shared_output = None
+        else: # MoE_remote
+            shared_output = self._forward_shared_experts(hidden_states)
+        ###############################################################
+
+        ###############################################################
+        # NOTE: Gate/Top-k
+        # router_logits: (num_tokens, n_experts)
+        kwargs = {"hidden_states": hidden_states}
+        if topk_output is None:
+            router_logits = self.gate(hidden_states)
+            if self.topk is not None:
+                kwargs["topk_output"] = self.topk(hidden_states, router_logits)
+            else:
+                kwargs["router_logits"] = router_logits
+        else:
+            kwargs["topk_output"] = topk_output
+        kwargs["topk_ids_mask"] = topk_ids_mask
+        kwargs["w1_buf"] = w1_buf
+        kwargs["w2_buf"] = w2_buf
+        ###############################################################
+        
+        ###############################################################
+        # NOTE: MoE Computation
+        final_hidden_states = self.experts(**kwargs)
+        if not _is_cuda and not _use_aiter:
+            # fused in biased_grouped_topk so we can skip here
+            final_hidden_states *= self.routed_scaling_factor
+        ###############################################################
+
+        ###############################################################
+        # NOTE: Add results
+        if shared_output is not None:
+            final_hidden_states = final_hidden_states + shared_output
+        ###############################################################
+
+        ###############################################################
+        # NOTE: Combine
+        # No all-reduce here: the decoder layer all-reduces the MoE output
+        ###############################################################
+
+        return final_hidden_states
+
+    
+    def forward_normal_ori(
+        self, hidden_states: torch.Tensor, can_fuse_mlp_allreduce: bool = False,
+        lina: Optional[Lina] = None,
+    ) -> torch.Tensor:
+        if hasattr(self, "shared_experts") and use_intel_amx_backend(
+            self.shared_experts.gate_up_proj
+        ):
+            return self.forward_cpu(hidden_states, can_fuse_mlp_allreduce)
+
+        ###############################################################
+        # NOTE: Shared expert computation
+        shared_output = self._forward_shared_experts(hidden_states)
+        ###############################################################
+
+        ###############################################################
+        # NOTE: Gate/Top-k
+        # router_logits: (num_tokens, n_experts)
+        router_logits = self.gate(hidden_states)
+        kwargs = {"hidden_states": hidden_states}
+        if self.topk is not None:
+            kwargs["topk_output"] = self.topk(hidden_states, router_logits)
+        else:
+            kwargs["router_logits"] = router_logits
+        if lina is not None:
+            lina.record(self.layer_id, kwargs["topk_output"].topk_ids)
+        ###############################################################
+        
+        ###############################################################
+        # NOTE: MoE Computation
+        final_hidden_states = self.experts(**kwargs)
+        if not _is_cuda and not _use_aiter:
+            # fused in biased_grouped_topk so we can skip here
+            final_hidden_states *= self.routed_scaling_factor
+        ###############################################################
+
+        ###############################################################
+        # NOTE: Add results
+        if shared_output is not None:
+            final_hidden_states = final_hidden_states + shared_output
+        ###############################################################
+
+        ###############################################################
+        # NOTE: Combine
+        if self.tp_size > 1 and not can_fuse_mlp_allreduce:
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        ###############################################################
+
+        return final_hidden_states
 
     def forward_normal_dual_stream(
         self, hidden_states: torch.Tensor, can_fuse_mlp_allreduce: bool = False

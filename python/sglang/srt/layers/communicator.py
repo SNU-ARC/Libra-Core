@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# Modified from SGLang v0.4.10 (https://github.com/sgl-project/sglang) for Libra (ICLR 2026).
 
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -402,8 +403,10 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
         if context.attn_dp_size != 1:
-            if context.attn_tp_rank == 0:
-                hidden_states += residual
+            # NOTE: The residual connection is done in the modified Qwen3-MoE / GLM-4.5 decoder
+            # layers (forward_ori, forward_mid_first, forward_mid), so the upstream add is removed:
+            # if context.attn_tp_rank == 0:
+            #     hidden_states += residual
             hidden_states, local_hidden_states = (
                 forward_batch.gathered_buffer,
                 hidden_states,

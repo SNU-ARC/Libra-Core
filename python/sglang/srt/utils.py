@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# Modified from SGLang v0.4.10 (https://github.com/sgl-project/sglang) for Libra (ICLR 2026).
 """Common utilities."""
 
 from __future__ import annotations
@@ -88,6 +89,10 @@ from triton.runtime.cache import FileCacheManager
 
 from sglang.srt.metrics.func_timer import enable_func_timer
 
+
+from dataclasses import dataclass
+import torch.distributed._symmetric_memory as symm_mem
+
 logger = logging.getLogger(__name__)
 
 show_time_cost = False
@@ -95,6 +100,190 @@ time_infos = {}
 
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
+
+###############################################################################
+# Libra: configuration and helpers
+###############################################################################
+# Replication budget, read at import time from the environment (exported by the launcher
+# scripts in single_node_scripts/).
+# N: number of replicated experts per GPU (extra rows in the expert buffers).
+EXPERT_DUP_FACTOR_N = int(os.getenv('EXPERT_DUP_FACTOR_N', 12))
+# L: number of those replicas chosen as the GPU's local hot experts (phase 1).
+EXPERT_DUP_FACTOR_L = 1  # Lina branch: fixed, not read from the environment (Lina does not use L)
+# P: maximum number of destination GPUs a GPU sends replicas to (7 = no limit on 8 GPUs).
+EXPERT_DUP_MAX = 7
+# Q: minimum number of tokens a replica must process (0 = disabled).
+MIN_TOKEN_LIMIT = 0
+
+LIBRA_SCHEMES = ("sglang", "eplb", "libra", "lina")
+
+
+def get_libra_scheme() -> str:
+    """Load-balancing scheme of this run, set by the launcher scripts via $LIBRA_SCHEME."""
+    scheme = os.environ.get("LIBRA_SCHEME")
+    if scheme not in LIBRA_SCHEMES:
+        raise ValueError(
+            f"LIBRA_SCHEME must be one of {LIBRA_SCHEMES}, got {scheme!r}. "
+            "Use the launcher scripts in single_node_scripts/ or export it explicitly."
+        )
+    return scheme
+
+
+def find_rows_with_large_diff(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    threshold: float = 0.1,
+    min_count: int = 1,
+) -> torch.Tensor:
+    """Return row indices where *a* and *b* differ by at least *threshold* in
+    at least *min_count* elements.
+
+    Args:
+        a (torch.Tensor): First input tensor of shape (N, M).
+        b (torch.Tensor): Second tensor of identical shape (N, M).
+        threshold (float, optional): Absolute‑difference cutoff. Defaults to 0.1.
+        min_count (int, optional): Minimum number of elements per row that must
+            exceed *threshold*. Defaults to 1.
+
+    Returns:
+        torch.Tensor: 1‑D **CPU** tensor (int64) containing the qualifying row
+            indices in ascending order.
+    """
+
+    # Basic sanity checks -----------------------------------------------------
+    if a.shape != b.shape:
+        raise ValueError(f"Shape mismatch: a{a.shape} vs b{b.shape}")
+    if a.ndim != 2:
+        raise ValueError("Tensors must be 2‑D (rows, cols)")
+
+    # Main computation --------------------------------------------------------
+    diff_mask = ~torch.isclose(a, b, rtol=0.01, atol=0.1)  # Lina branch: rtol/atol test, `threshold` is ignored
+    row_counts = diff_mask.sum(dim=1)       # per‑row counts (same device)
+    idx = torch.nonzero(row_counts >= min_count, as_tuple=False).squeeze(1)
+
+    return idx.cpu()
+
+
+###############################################################################
+# Expert replication with SymmetricMemory P2P copies
+###############################################################################
+@dataclass
+class P2PPlan:
+    # weight tensors for the next layer
+    w13_weight: torch.Tensor
+    w2_weight: torch.Tensor
+    # Handlers for accessing other ranks' buffers
+    w13_weight_hdl: Any
+    w2_weight_hdl: Any
+    # Expert IDs for send and recv
+    send_map: torch.Tensor
+    send_map_len: torch.Tensor
+    recv_map_len: torch.Tensor
+    cum_recv_map_len: torch.Tensor
+    dp_size: int
+    dp_rank: int
+    w13_weight_buf_shape: Tuple[int, ...]
+    w2_weight_buf_shape: Tuple[int, ...]
+
+    def check(self):
+        assert self.send_map.dim() == 3 and self.send_map.size(0) == self.dp_size and self.send_map.size(1) == self.dp_size
+        assert self.send_map_len.shape == (self.dp_size, self.dp_size)
+        assert self.recv_map_len.shape == (self.dp_size, self.dp_size)
+        assert self.cum_recv_map_len.shape == (self.dp_size, self.dp_size)
+
+
+def create_large_buffer_symm(weights: torch.Tensor, additional_size):
+    """Allocate a zero-initialized SymmetricMemory copy of `weights` with `additional_size` extra rows
+    (slots for replicated experts) and rendezvous it on the WORLD group; returns (buffer, handle)."""
+    original_shape = list(weights.shape)
+    original_shape[0] += additional_size
+
+    moe_compute_buf = symm_mem.empty(original_shape, dtype=weights.dtype, device="cuda")
+    moe_compute_hdl = symm_mem.rendezvous(moe_compute_buf, dist.group.WORLD)
+
+    moe_compute_buf.zero_()
+
+    return moe_compute_buf, moe_compute_hdl
+
+
+def compute_cum_recv_map_len(recv_map_len_out: torch.Tensor) -> torch.Tensor:
+    """cum[i,j] = sum_{k<j} recv[i,k].
+    recv_map_len_out: [G,G] (int64) where [dst i, src j].
+    """
+    assert recv_map_len_out.dim() == 2
+    G0, G1 = recv_map_len_out.shape
+    assert G0 == G1, "recv_map_len_out must be square [G,G]"
+    assert recv_map_len_out.dtype == torch.int64
+    csum = torch.cumsum(recv_map_len_out, dim=1)
+    zero = torch.zeros_like(recv_map_len_out[:, :1])
+    cum = torch.cat([zero, csum[:, :-1]], dim=1)
+    return cum
+
+
+###############################################################################
+# All-gather of per-rank routing results through SymmetricMemory
+###############################################################################
+def broadcast_topk_with_next(
+    topk_ids_buf, 
+    topk_weights_buf,
+    next_topk_ids_buf,
+    topk_ids_hdl, 
+    topk_weights_hdl,
+    next_topk_ids_hdl,
+    tp_rank, 
+    tp_size, 
+    topk,
+    stream,
+    device
+):
+    B_max = topk_ids_buf.shape[0]
+    K = topk_ids_buf.shape[1]
+
+    # Wait until every rank has written its routing results to its symmetric buffers.
+    topk_ids_hdl.barrier(channel=0)
+
+    # TODO: Use pre-allocated buffers
+    out_topk_ids = torch.empty((tp_size, B_max, K), dtype=torch.int32, device=device)
+    out_topk_weights = torch.empty((tp_size, B_max, K), dtype=torch.float32, device=device)
+    out_next_topk_ids = torch.empty((tp_size, B_max, K), dtype=torch.int32, device=device)
+    for r in range(tp_size):
+        peer_topk_ids = topk_ids_hdl.get_buffer(r, (B_max, K), torch.int32)
+        peer_topk_weights = topk_weights_hdl.get_buffer(r, (B_max, K), torch.float32)
+        peer_next_topk_ids = next_topk_ids_hdl.get_buffer(r, (B_max, K), torch.int32)
+
+        out_topk_ids[r].copy_(peer_topk_ids)
+        out_topk_weights[r].copy_(peer_topk_weights)
+        out_next_topk_ids[r].copy_(peer_next_topk_ids)
+    return out_topk_ids.view(-1, topk), out_topk_weights.view(-1, topk), out_next_topk_ids.view(-1, topk)
+
+
+def broadcast_topk(
+    topk_ids_buf, 
+    topk_weights_buf,
+    topk_ids_hdl, 
+    topk_weights_hdl,
+    tp_rank, 
+    tp_size, 
+    topk,
+    stream,
+    device
+):
+    B_max = topk_ids_buf.shape[0]
+    K = topk_ids_buf.shape[1]
+
+    # Wait until every rank has written its routing results to its symmetric buffers.
+    topk_ids_hdl.barrier(channel=0)
+
+    out_topk_ids = torch.empty((tp_size, B_max, K), dtype=torch.int32, device=device)
+    out_topk_weights = torch.empty((tp_size, B_max, K), dtype=torch.float32, device=device)
+    for r in range(tp_size):
+        peer_topk_ids = topk_ids_hdl.get_buffer(r, (B_max, K), torch.int32)
+        peer_topk_weights = topk_weights_hdl.get_buffer(r, (B_max, K), torch.float32)
+
+        out_topk_ids[r].copy_(peer_topk_ids)
+        out_topk_weights[r].copy_(peer_topk_weights)
+    return out_topk_ids.view(-1, topk), out_topk_weights.view(-1, topk)
+###############################################################################
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 def is_hip() -> bool:

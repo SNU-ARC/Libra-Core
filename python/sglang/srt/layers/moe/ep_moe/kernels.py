@@ -1,3 +1,4 @@
+# Modified from SGLang v0.4.10 (https://github.com/sgl-project/sglang) for Libra (ICLR 2026).
 import logging
 from typing import List, Optional
 
@@ -18,6 +19,175 @@ if _is_cuda:
 
 import triton.language as tl
 
+########################################################################
+# Libra: segmented in-place add used to combine the MoE_local and MoE_remote outputs
+@triton.jit
+def add_dual_offsets_kernel(
+    dst_ptr,                 # *f16/bf16/f32* [N, H]
+    src_ptr,                 # *f16/bf16/f32* [T, H]
+    off_src_ptr,             # *i32* [R]
+    off_dst_ptr,             # *i32* [R]
+    size_ptr,                # *i32* [R]
+    H: tl.constexpr,
+    TOK_BLK: tl.constexpr,   # block along token dimension
+    COL_BLK: tl.constexpr,   # block along hidden dimension
+):
+    r = tl.program_id(0)      # segment id
+    tb = tl.program_id(1)     # token-tile id within segment
+    cb = tl.program_id(2)     # column-tile id
+
+    off_s = tl.load(off_src_ptr + r)
+    off_d = tl.load(off_dst_ptr + r)
+    sz    = tl.load(size_ptr    + r)
+
+    t = tb * TOK_BLK + tl.arange(0, TOK_BLK)
+    cols = cb * COL_BLK + tl.arange(0, COL_BLK)
+
+    mask_t = t < sz
+    mask_c = cols < H
+    active = mask_t[:, None] & mask_c[None, :]
+
+    # NOTE: avoid tl.any/tl.all to support older Triton versions.
+    # We simply rely on masked loads/stores; no early return branch.
+
+    src_rows = off_s + t
+    dst_rows = off_d + t
+
+    # Row-major pointers
+    src_ix = src_rows[:, None] * H + cols[None, :]
+    dst_ix = dst_rows[:, None] * H + cols[None, :]
+
+    src_vals = tl.load(src_ptr + src_ix, mask=active, other=0)
+    dst_vals = tl.load(dst_ptr + dst_ix, mask=active, other=0)
+    tl.store(dst_ptr + dst_ix, dst_vals + src_vals, mask=active)
+
+def segmented_add_inplace(
+    dst: torch.Tensor,
+    src: torch.Tensor,
+    off_src: torch.Tensor,
+    off_dst: torch.Tensor,
+    sizes: torch.Tensor,
+    *,
+    tok_blk: int = 16,
+    col_blk: int = 256,
+    num_warps: int = 4,
+    num_stages: int = 2,
+):
+    """
+    dst[off_dst[i] : off_dst[i] + sizes[i], :] += src[off_src[i] : off_src[i] + sizes[i], :]
+    for all i in [0, R).
+
+    Requirements:
+      - dst, src are 2D and contiguous on the same CUDA device
+      - off_src, off_dst, sizes are 1D int tensors on the same CUDA device
+      - Segments (off_dst[i] .. off_dst[i] + sizes[i]) do not overlap across i
+    """
+    assert dst.is_cuda and src.is_cuda and dst.device == src.device
+    assert dst.ndim == 2 and src.ndim == 2 and dst.shape[1] == src.shape[1]
+    assert dst.is_contiguous() and src.is_contiguous()
+    assert off_src.is_cuda and off_dst.is_cuda and sizes.is_cuda
+    assert off_src.device == dst.device == off_dst.device == sizes.device
+    assert off_src.dtype in (torch.int32, torch.int64)
+    assert off_dst.dtype in (torch.int32, torch.int64)
+    assert sizes.dtype   in (torch.int32, torch.int64)
+
+    R = sizes.numel()
+    H = dst.shape[1]
+
+    if sizes.numel() == 0:
+        return
+    tb_tiles = (src.shape[0] + tok_blk - 1) // tok_blk
+
+    # Kernel grid
+    grid = (
+        R,
+        tb_tiles,
+        (H + col_blk - 1) // col_blk,
+    )
+
+    add_dual_offsets_kernel[grid](
+        dst,
+        src,
+        off_src,
+        off_dst,
+        sizes,
+        H,
+        TOK_BLK=tok_blk,
+        COL_BLK=col_blk,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+def fused_add_without_zero_init_v2(
+    hidden_states: torch.Tensor,              # [T*G, H]
+    local_hidden_states: torch.Tensor,        # [T, H]
+    remote_hidden_states_ours: torch.Tensor | None,  # [T*G, H] or None
+    zero_offset: torch.Tensor,                # [R]  int offsets into local (src)
+    local_start_pos: torch.Tensor,            # [R]  int offsets into global (dst)
+    local_num_tokens: torch.Tensor,           # [R]  lengths per segment
+    use_triton: bool = True,
+):
+    """
+    Combine the MoE_local output into the MoE_remote output without a zero-filled buffer.
+
+    For every segment i, rows [zero_offset[i], zero_offset[i] + local_num_tokens[i]) of
+    `local_hidden_states` are added to rows [local_start_pos[i], local_start_pos[i] + local_num_tokens[i])
+    of the output:
+      - If `remote_hidden_states_ours` is given, the add is done in place into it and it is returned
+        (this is the path used by Libra, with use_triton=True).
+      - Otherwise `hidden_states` is zeroed, the segments are copied into it, and it is returned.
+    """
+    assert hidden_states.ndim == 2 and local_hidden_states.ndim == 2
+    assert hidden_states.shape[1] == local_hidden_states.shape[1]
+
+    if remote_hidden_states_ours is not None:
+        # Avoid memset(0): just copy remote, then add local on the fly.
+        if use_triton:
+            segmented_add_inplace(
+                remote_hidden_states_ours,
+                local_hidden_states,
+                zero_offset,
+                local_start_pos,
+                local_num_tokens,
+            )
+        else:
+            # Torch fallback (may be slower if R is large)
+            off_s = zero_offset.to(device=hidden_states.device, dtype=torch.long)
+            off_d = local_start_pos.to(device=hidden_states.device, dtype=torch.long)
+            sz    = local_num_tokens.to(device=hidden_states.device, dtype=torch.long)
+            for i in range(sz.numel()):
+                n = int(sz[i].item())
+                if n == 0:
+                    continue
+                s0 = int(off_s[i].item())
+                d0 = int(off_d[i].item())
+                hidden_states[d0:d0+n].add_(local_hidden_states[s0:s0+n])
+        return remote_hidden_states_ours
+    else:
+        # No remote: untouched rows must remain zeros -> keep original semantics.
+        hidden_states.zero_()
+        # Reuse the add kernel with dst initially zero, which is equivalent to copy.
+        if use_triton:
+            segmented_add_inplace(
+                hidden_states,
+                local_hidden_states,
+                zero_offset,
+                local_start_pos,
+                local_num_tokens,
+            )
+        else:
+            off_s = zero_offset.to(device=hidden_states.device, dtype=torch.long)
+            off_d = local_start_pos.to(device=hidden_states.device, dtype=torch.long)
+            sz    = local_num_tokens.to(device=hidden_states.device, dtype=torch.long)
+            for i in range(sz.numel()):
+                n = int(sz[i].item())
+                if n == 0:
+                    continue
+                s0 = int(off_s[i].item())
+                d0 = int(off_d[i].item())
+                hidden_states[d0:d0+n].copy_(local_hidden_states[s0:s0+n])
+        return hidden_states
+########################################################################
 
 @triton.jit
 def deepep_permute_triton_kernel(
